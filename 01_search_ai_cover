@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+01_search_ai_cover.py
+
+═══════════════════════════════════════════════════════════════
+연구 목적
+═══════════════════════════════════════════════════════════════
+YouTube AI Cover 생태계에서 두 가지 정책의 효과를 비교하는
+Event Study / ITS (Interrupted Time Series) 연구를 위한
+시드 영상 수집 스크립트입니다.
+
+분석 대상 정책:
+  - 정책 1: 공개 의무 정책 (2024-03-18)
+             AI 생성 콘텐츠 공개 라벨 의무화
+  - 정책 2: 수익 제재 정책 (2025-07-15)
+             반복·대량 생산 콘텐츠 수익화 박탈
+
+수집 기간:
+  - 2023-09-01 ~ 2026-01-31 (총 28개월)
+  - 정책 1 사전 6개월 포함 (anticipation effect 검증용)
+  - 두 정책 사이 16개월 포함
+  - 정책 2 사후 6개월 포함
+
+═══════════════════════════════════════════════════════════════
+이 스크립트가 하는 일
+═══════════════════════════════════════════════════════════════
+YouTube Data API v3의 search.list 엔드포인트를 사용하여
+"ai cover" 키워드로 검색된 영상의 video_id와 channel_id를
+7일 단위 윈도우로 수집합니다.
+
+출력 파일:
+  - 01_seed_videos.csv         : 수집된 영상 데이터
+  - 01_completed_windows.txt   : 정상 완료된 윈도우 목록
+
+═══════════════════════════════════════════════════════════════
+Resume(이어서 수집) 방식
+═══════════════════════════════════════════════════════════════
+핵심: 완료된 윈도우는 API 요청 자체를 건너뜁니다.
+
+동작 방식:
+  1. 윈도우가 모든 페이지를 정상 완료하면
+     01_completed_windows.txt에 해당 윈도우를 기록
+  2. 다음 실행 시 이 파일을 먼저 로드
+  3. 기록된 윈도우는 API 요청 없이 즉시 건너뜀
+  4. 기록되지 않은 윈도우만 API 요청
+
+API 키를 교체해도 completed_windows.txt는 유지되므로
+이미 완료된 윈도우는 새 키로 다시 요청하지 않습니다.
+
+중간에 에러가 발생하거나 쿼터 초과로 중단된 윈도우는
+완료 기록되지 않으므로 다음 실행 시 처음부터 재수집됩니다.
+
+═══════════════════════════════════════════════════════════════
+API 키 설정 방법
+═══════════════════════════════════════════════════════════════
+1. Google Cloud Console (https://console.cloud.google.com) 접속
+2. 프로젝트 선택 또는 생성
+3. "API 및 서비스" → "YouTube Data API v3" 활성화
+4. "사용자 인증 정보" → "API 키" 생성
+5. 아래 API_KEY 변수에 생성한 키를 입력하세요
+
+일일 쿼터: 기본 10,000 units / search.list 1회 = 100 units
+이 스크립트 전체 실행 시 약 12,100 units 소모 (약 2일 소요)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set, Tuple
+
+import requests
+
+
+# ═══════════════════════════════════════════════════════════════
+# 설정값
+# ═══════════════════════════════════════════════════════════════
+
+API_URL = "https://www.googleapis.com/youtube/v3/search"
+
+# ✅ 여기에 YouTube Data API 키를 입력하세요
+API_KEY = "KEY"
+
+SEARCH_QUERY     = "ai cover"
+COLLECTION_START = "2023-09-01"
+COLLECTION_END   = "2026-01-31"
+
+# 정책 기준일 (로그 phase 표시용)
+POLICY1_ANNOUNCE = "2023-11-14"  # 공개 의무 정책 예고
+POLICY1_DATE     = "2024-03-18"  # 공개 의무 정책 시행
+POLICY2_DATE     = "2025-07-15"  # 수익 제재 정책 시행
+
+# 출력 파일
+DEFAULT_OUTPUT            = "01_seed_videos.csv"
+DEFAULT_COMPLETED_WINDOWS = "01_completed_windows.txt"
+
+# CSV 컬럼 정의
+CSV_COLUMNS = [
+    "video_id",            # 영상 식별자 → STEP 2(videos.list) 입력값
+    "channel_id",          # 채널 식별자 → STEP 3(channels.list) 입력값
+    "search_window_start", # 7일 윈도우 시작일 → 주차 계산용
+    "search_window_end",   # 7일 윈도우 종료일 → 주차 계산용
+    "collected_at_utc",    # 수집 시각 → 데이터 품질 추적용
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 커맨드라인 인자
+# ═══════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "YouTube 'ai cover' 키워드로 영상을 수집합니다.\n"
+            "수집 기간: 2023-09-01 ~ 2026-01-31 (28개월)\n"
+            "\n"
+            "Resume 방식: 완료된 윈도우는 API 요청 없이 건너뜁니다.\n"
+            "API 키를 교체해도 이미 완료된 윈도우는 재수집하지 않습니다."
+        )
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=API_KEY,
+        help="YouTube Data API 키 (코드 상단 API_KEY 변수에 입력 권장)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=DEFAULT_OUTPUT,
+        help=f"영상 데이터 출력 CSV (기본값: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--completed-windows",
+        type=str,
+        default=DEFAULT_COMPLETED_WINDOWS,
+        help=(
+            f"완료된 윈도우 목록 파일 (기본값: {DEFAULT_COMPLETED_WINDOWS})\n"
+            "이 파일에 기록된 윈도우는 API 요청 없이 건너뜁니다."
+        ),
+    )
+    parser.add_argument(
+        "--max-results-per-page",
+        type=int,
+        default=50,
+        help="페이지당 최대 결과 수 (1~50, 기본값: 50)",
+    )
+    parser.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=0.2,
+        help="API 요청 간 대기 시간(초) (기본값: 0.2)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        default=False,
+        help=(
+            "처음부터 다시 수집합니다.\n"
+            "경고: 기존 CSV와 completed_windows 파일이 모두 삭제됩니다."
+        ),
+    )
+    return parser.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 입력값 검증
+# ═══════════════════════════════════════════════════════════════
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.api_key or args.api_key == "여기에_API_키_입력":
+        raise ValueError(
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌ API 키가 설정되지 않았습니다.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "방법 1. 코드 상단 API_KEY 변수에 직접 입력:\n"
+            '  API_KEY = "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"\n'
+            "\n"
+            "방법 2. 커맨드라인 인자로 전달:\n"
+            '  python 01_search_ai_cover.py --api-key "AIzaSyXXXX..."\n'
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    if not (1 <= args.max_results_per_page <= 50):
+        raise ValueError("--max-results-per-page는 1~50 사이여야 합니다.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7일 단위 윈도우 생성
+# ═══════════════════════════════════════════════════════════════
+
+def generate_weekly_windows(
+    start_date: str,
+    end_date: str,
+) -> List[Tuple[str, str]]:
+    """
+    수집 기간을 7일 단위로 분할합니다.
+
+    7일로 분할하는 이유:
+      - search.list는 하나의 쿼리+기간으로 최대 약 500개 반환
+      - 7일로 쪼개면 주당 최대 500개씩 수집 가능
+      - 최종 분석의 'week' 단위와 일치하여 일관성 확보
+
+    Returns:
+        [(window_start_iso, window_end_iso), ...] 리스트
+        ISO 8601 형식: "2023-09-01T00:00:00Z"
+    """
+    start_dt      = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt        = datetime.strptime(end_date, "%Y-%m-%d")
+    end_exclusive = end_dt + timedelta(days=1)
+
+    windows: List[Tuple[str, str]] = []
+    current = start_dt
+
+    while current < end_exclusive:
+        next_boundary = min(current + timedelta(days=7), end_exclusive)
+        windows.append((
+            current.strftime("%Y-%m-%dT00:00:00Z"),
+            next_boundary.strftime("%Y-%m-%dT00:00:00Z"),
+        ))
+        current = next_boundary
+
+    return windows
+
+
+# ═══════════════════════════════════════════════════════════════
+# 완료된 윈도우 관리
+# ═══════════════════════════════════════════════════════════════
+
+def load_completed_windows(filepath: str) -> Set[str]:
+    """
+    01_completed_windows.txt에서 완료된 윈도우 목록을 로드합니다.
+
+    완료된 윈도우 = 모든 페이지를 정상 수집하고
+                   nextPageToken=no로 종료된 윈도우
+
+    이 함수가 반환하는 집합에 포함된 윈도우는
+    다음 실행 시 API 요청 없이 즉시 건너뜁니다.
+
+    API 키가 바뀌어도 이 파일은 그대로이므로
+    완료된 윈도우는 새 키로 다시 요청하지 않습니다.
+
+    Returns:
+        {"2023-09-01T00:00:00Z", "2023-09-08T00:00:00Z", ...}
+    """
+    completed: Set[str] = set()
+    if not os.path.exists(filepath):
+        return completed
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            window = line.strip()
+            if window:
+                completed.add(window)
+
+    return completed
+
+
+def mark_window_completed(filepath: str, window_start: str) -> None:
+    """
+    윈도우가 정상 완료됐을 때 01_completed_windows.txt에 기록합니다.
+
+    기록 조건 (모두 충족해야 함):
+      ✅ 해당 윈도우의 모든 페이지를 수집 완료
+      ✅ nextPageToken이 없어서 자연스럽게 종료
+      ✅ HTTP 에러나 쿼터 초과 없음
+
+    기록되지 않는 경우:
+      ❌ HTTP 에러 발생
+      ❌ 쿼터 초과로 중단
+      ❌ KeyboardInterrupt로 중단
+    """
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(window_start + "\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 파일 초기화 (reset 모드)
+# ═══════════════════════════════════════════════════════════════
+
+def reset_output_files(output_path: str, completed_path: str) -> None:
+    """--reset 옵션 사용 시 기존 파일을 삭제합니다."""
+    for path in [output_path, completed_path]:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[RESET] 삭제됨: {path}")
+
+
+def ensure_csv_header(output_path: str) -> None:
+    """출력 CSV 파일이 없을 때만 헤더를 작성합니다."""
+    if os.path.exists(output_path):
+        return
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+
+
+# ═══════════════════════════════════════════════════════════════
+# API 요청
+# ═══════════════════════════════════════════════════════════════
+
+def request_search_page(
+    api_key: str,
+    query: str,
+    published_after: str,
+    published_before: str,
+    max_results: int,
+    page_token: str = "",
+    session: Optional[requests.Session] = None,
+) -> Dict:
+    """
+    YouTube search.list API를 호출합니다.
+
+    order=date 정렬을 사용하는 이유:
+      - relevance 정렬은 알고리즘 편향으로 인기 영상이 과대 대표됨
+      - date 정렬이 연구 표본의 시간적 대표성에 더 유리
+    """
+    params = {
+        "key":             api_key,
+        "part":            "snippet",
+        "q":               query,
+        "type":            "video",
+        "order":           "date",
+        "publishedAfter":  published_after,
+        "publishedBefore": published_before,
+        "maxResults":      max_results,
+    }
+    if page_token:
+        params["pageToken"] = page_token
+
+    requester = session or requests
+    response  = requester.get(API_URL, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 응답 파싱
+# ═══════════════════════════════════════════════════════════════
+
+def parse_search_items(
+    items: List[Dict],
+    window_start: str,
+    window_end: str,
+    collected_at_utc: str,
+) -> List[Dict]:
+    """
+    search.list 응답에서 필요한 컬럼만 추출합니다.
+
+    title, description 등을 여기서 수집하지 않는 이유:
+      search.list 결과의 메타데이터는 불완전(잘린 description 등)
+      → STEP 2(videos.list)에서 정확한 값으로 확정
+    """
+    rows: List[Dict] = []
+
+    for item in items:
+        id_obj  = item.get("id", {}) or {}
+        snippet = item.get("snippet", {}) or {}
+
+        video_id   = id_obj.get("videoId", "").strip()
+        channel_id = snippet.get("channelId", "").strip()
+
+        # video_id 없는 항목(채널, 플레이리스트 등) 제외
+        if not video_id:
+            continue
+
+        rows.append({
+            "video_id":            video_id,
+            "channel_id":          channel_id,
+            "search_window_start": window_start,
+            "search_window_end":   window_end,
+            "collected_at_utc":    collected_at_utc,
+        })
+
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════
+# CSV 저장
+# ═══════════════════════════════════════════════════════════════
+
+def append_rows(output_path: str, rows: List[Dict]) -> int:
+    """수집된 행을 CSV에 추가합니다."""
+    if not rows:
+        return 0
+    with open(output_path, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writerows(rows)
+    return len(rows)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 쿼터 초과 감지
+# ═══════════════════════════════════════════════════════════════
+
+def is_quota_exceeded(exc: requests.HTTPError) -> bool:
+    """
+    quotaExceeded 에러를 감지합니다.
+    감지 즉시 수집을 중단하여 API 키 차단을 방지합니다.
+    """
+    try:
+        text = exc.response.text.lower()
+    except Exception:
+        text = str(exc).lower()
+    return "quotaexceeded" in text
+
+
+# ═══════════════════════════════════════════════════════════════
+# 정책 구간 판별 (로그 출력용)
+# ═══════════════════════════════════════════════════════════════
+
+def get_phase(window_start: str) -> str:
+    """윈도우가 어느 정책 구간에 속하는지 반환합니다."""
+    date = window_start[:10]
+    if date < POLICY1_ANNOUNCE:
+        return "① Pre-Announce    "
+    elif date < POLICY1_DATE:
+        return "② Pre-Policy1     "
+    elif date < POLICY2_DATE:
+        return "③ Between-Policies"
+    else:
+        return "④ Post-Policy2    "
+
+
+# ═══════════════════════════════════════════════════════════════
+# 수집 계획 출력
+# ═══════════════════════════════════════════════════════════════
+
+def print_plan(
+    windows: List[Tuple[str, str]],
+    completed: Set[str],
+    output_path: str,
+    completed_path: str,
+) -> None:
+    pending_count = sum(1 for w in windows if w[0] not in completed)
+
+    print("\n" + "═" * 65)
+    print("  YouTube AI Cover 시드 영상 수집")
+    print("═" * 65)
+    print(f"  키워드              : {SEARCH_QUERY}")
+    print(f"  수집 기간           : {COLLECTION_START} ~ {COLLECTION_END}")
+    print(f"  총 윈도우 수        : {len(windows)}개 (7일 단위)")
+    print(f"  이미 완료된 윈도우  : {len(completed)}개 → API 요청 없이 건너뜀")
+    print(f"  이번에 수집할 윈도우: {pending_count}개")
+    print(f"  예상 쿼터 소모      : {pending_count * 100:,} units")
+    print(f"  영상 데이터 파일    : {output_path}")
+    print(f"  완료 기록 파일      : {completed_path}")
+    print("─" * 65)
+    print("  정책 구간")
+    print(f"  ① Pre-Announce     : ~ {POLICY1_ANNOUNCE} (정책1 예고 전)")
+    print(f"  ② Pre-Policy1      : {POLICY1_ANNOUNCE} ~ {POLICY1_DATE}")
+    print(f"  ③ Between-Policies : {POLICY1_DATE} ~ {POLICY2_DATE}")
+    print(f"  ④ Post-Policy2     : {POLICY2_DATE} ~")
+    print("═" * 65 + "\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 메인 실행
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    # reset 모드: 기존 파일 삭제 후 처음부터
+    if args.reset:
+        print("\n[RESET] 기존 파일을 삭제하고 처음부터 수집합니다.")
+        reset_output_files(args.output, args.completed_windows)
+
+    # 7일 단위 윈도우 생성 (28개월 전체)
+    windows = generate_weekly_windows(COLLECTION_START, COLLECTION_END)
+
+    # ─────────────────────────────────────────────────────────
+    # 완료된 윈도우 로드
+    # 핵심: 이 집합에 있는 윈도우는 API 요청 자체를 건너뜁니다.
+    # API 키가 바뀌어도 이 파일은 유지됩니다.
+    # ─────────────────────────────────────────────────────────
+    completed_windows = load_completed_windows(args.completed_windows)
+
+    # CSV 헤더 초기화 (파일이 없을 때만)
+    ensure_csv_header(args.output)
+
+    print_plan(windows, completed_windows, args.output, args.completed_windows)
+
+    # 수집 통계
+    total_requests    = 0
+    total_saved       = 0
+    windows_skipped   = 0
+    windows_completed = 0
+    windows_error     = 0
+
+    session = requests.Session()
+
+    try:
+        for window_idx, (window_start, window_end) in enumerate(windows, start=1):
+
+            phase = get_phase(window_start)
+
+            # ─────────────────────────────────────────────────
+            # 핵심 로직: 완료된 윈도우 건너뛰기
+            #
+            # completed_windows.txt에 기록된 윈도우는
+            # API 요청 없이 즉시 다음 윈도우로 넘어갑니다.
+            # 이것이 이전 방식(응답 받은 후 중복 체크)과의 차이점입니다.
+            # ─────────────────────────────────────────────────
+            if window_start in completed_windows:
+                windows_skipped += 1
+                print(
+                    f"[{window_idx:3d}/{len(windows)}] "
+                    f"{phase} "
+                    f"{window_start[:10]} → {window_end[:10]} "
+                    f"| ✅ SKIP"
+                )
+                continue
+
+            # 수집 대상 윈도우
+            print(
+                f"\n[{window_idx:3d}/{len(windows)}] "
+                f"{phase} "
+                f"{window_start[:10]} → {window_end[:10]}"
+            )
+
+            next_page_token = ""
+            page_no         = 0
+            window_saved    = 0
+            window_error    = False
+
+            # ─────────────────────────────────────────────────
+            # 페이지네이션 루프
+            # nextPageToken이 없을 때까지 반복 수집
+            # ─────────────────────────────────────────────────
+            while True:
+                page_no += 1
+                collected_at_utc = datetime.now(timezone.utc).isoformat()
+
+                try:
+                    data = request_search_page(
+                        api_key          = args.api_key,
+                        query            = SEARCH_QUERY,
+                        published_after  = window_start,
+                        published_before = window_end,
+                        max_results      = args.max_results_per_page,
+                        page_token       = next_page_token,
+                        session          = session,
+                    )
+                    total_requests += 1
+
+                except requests.HTTPError as exc:
+                    status = getattr(exc.response, "status_code", "unknown")
+                    print(f"  [ERROR] HTTP {status}: {exc}")
+
+                    if is_quota_exceeded(exc):
+                        # 쿼터 초과: 즉시 중단
+                        # 현재 윈도우는 완료 기록 안 됨 → 다음 실행 시 재수집
+                        print(
+                            "\n  [STOP] ❌ 쿼터 초과 감지. 즉시 중단합니다.\n"
+                            f"  현재 윈도우({window_start[:10]})는 "
+                            "완료 기록되지 않았으므로\n"
+                            "  내일 다시 실행하면 이 윈도우부터 이어서 수집됩니다."
+                        )
+                        raise
+
+                    # 그 외 HTTP 에러: 현재 윈도우 건너뛰고 다음으로
+                    window_error = True
+                    break
+
+                except requests.RequestException as exc:
+                    print(f"  [ERROR] 요청 실패: {exc}")
+                    window_error = True
+                    break
+
+                items = data.get("items", [])
+
+                if not items:
+                    print(f"  [PAGE {page_no}] 결과 없음")
+                    break
+
+                rows = parse_search_items(
+                    items            = items,
+                    window_start     = window_start,
+                    window_end       = window_end,
+                    collected_at_utc = collected_at_utc,
+                )
+
+                saved_now    = append_rows(args.output, rows)
+                window_saved += saved_now
+                total_saved  += saved_now
+
+                has_next = bool(data.get("nextPageToken"))
+                print(
+                    f"  [PAGE {page_no}] "
+                    f"seen={len(rows):3d}  "
+                    f"saved={saved_now:3d}  "
+                    f"nextPage={'yes' if has_next else 'no '}"
+                )
+
+                next_page_token = data.get("nextPageToken", "")
+                if not next_page_token:
+                    break
+
+                time.sleep(args.sleep_seconds)
+
+            # ─────────────────────────────────────────────────
+            # 윈도우 완료 기록
+            #
+            # 에러 없이 정상 종료된 경우에만 기록합니다.
+            # 기록된 윈도우는 다음 실행 시 API 요청 없이 건너뜁니다.
+            # 에러가 발생한 경우 기록하지 않으므로 다음 실행 시 재수집됩니다.
+            # ─────────────────────────────────────────────────
+            if not window_error:
+                mark_window_completed(args.completed_windows, window_start)
+                completed_windows.add(window_start)  # 메모리도 업데이트
+                windows_completed += 1
+                print(
+                    f"  → {window_saved}개 저장 "
+                    f"| ✅ 완료 기록됨"
+                )
+            else:
+                windows_error += 1
+                print(
+                    f"  → {window_saved}개 저장 "
+                    f"| ⚠️  에러 발생 → 다음 실행 시 재수집"
+                )
+
+            time.sleep(args.sleep_seconds)
+
+    except requests.HTTPError:
+        # 쿼터 초과 시 여기서 종료
+        pass
+
+    finally:
+        session.close()
+
+    # ─────────────────────────────────────────────────────────
+    # 최종 결과 출력
+    # ─────────────────────────────────────────────────────────
+    print("\n" + "═" * 65)
+    print("  수집 결과")
+    print("═" * 65)
+    print(f"  총 API 요청 수        : {total_requests:,}회")
+    print(f"  총 저장 항목 수       : {total_saved:,}개")
+    print(f"  건너뛴 윈도우         : {windows_skipped:,}개 (이미 완료)")
+    print(f"  이번에 완료된 윈도우  : {windows_completed:,}개")
+    print(f"  에러 발생 윈도우      : {windows_error:,}개 (다음 실행 시 재수집)")
+    print(f"  영상 데이터 파일      : {args.output}")
+    print(f"  완료 기록 파일        : {args.completed_windows}")
+    print("═" * 65)
+
+    remaining = len(windows) - windows_skipped - windows_completed
+    if remaining > 0:
+        print(
+            f"\n  ⚠️  아직 {remaining}개 윈도우가 남아있습니다.\n"
+            "  다시 실행하면 이어서 수집됩니다.\n"
+            "  (API 키를 바꿔도 완료된 윈도우는 재수집하지 않습니다)"
+        )
+    else:
+        print(
+            "\n  🎉 모든 윈도우 수집 완료!\n"
+            "  다음 단계: python 02_fetch_videos_meta.py\n"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\n[STOPPED] 사용자에 의해 중단되었습니다.\n"
+            "현재 윈도우는 완료 기록되지 않았으므로\n"
+            "다시 실행하면 해당 윈도우부터 이어서 수집됩니다."
+        )
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[FATAL] 예상치 못한 오류: {exc}")
+        sys.exit(1)
