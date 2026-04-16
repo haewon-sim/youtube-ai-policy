@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+02_fetch_videos_meta.py
+
+═══════════════════════════════════════════════════════════════
+이 스크립트가 하는 일
+═══════════════════════════════════════════════════════════════
+01_seed_videos.csv에서 수집된 video_id를 이용하여
+YouTube Data API v3의 videos.list 엔드포인트를 호출하고
+각 영상의 정확한 메타데이터를 수집합니다.
+
+01단계(search.list)에서 수집한 메타데이터를 쓰지 않는 이유:
+  - search.list의 description은 잘린(truncated) 값
+  - title, tags 등도 불완전할 수 있음
+  - videos.list가 공식적으로 정확한 메타데이터를 제공
+
+수집 후 규칙 기반으로 is_ai_cover 분류를 수행합니다.
+
+입력 파일: 01_seed_videos.csv
+출력 파일: 02_videos_meta.csv
+           02_completed_batches.txt (완료된 배치 기록)
+
+═══════════════════════════════════════════════════════════════
+수집 컬럼
+═══════════════════════════════════════════════════════════════
+video_id            : 영상 식별자
+channel_id          : 채널 식별자 → STEP 3 입력값
+published_at        : 게시 시각 (UTC) → 주차 계산용
+video_title         : 제목 → AI Cover 분류용
+video_description   : 설명 → AI Cover 분류용
+video_tags          : 태그 → AI Cover 분류용
+duration_sec        : 영상 길이(초) → Shorts 제외용
+view_count          : 조회수 → 수요 측 반응 분석용
+like_count          : 좋아요 수 → 보조 지표
+is_ai_cover         : AI Cover 영상 여부 (0/1) → 분석 표본 필터
+week_start_date     : ISO week 시작일 → Event Study 시간 축
+weeks_from_policy1  : 정책1 기준 상대 주차 → Event Study 변수
+weeks_from_policy2  : 정책2 기준 상대 주차 → Event Study 변수
+search_window_start : 검색 윈도우 시작일 (provenance)
+collected_at_utc    : 수집 시각
+
+═══════════════════════════════════════════════════════════════
+Resume 방식
+═══════════════════════════════════════════════════════════════
+01단계와 동일하게 배치 단위로 완료를 기록합니다.
+완료된 배치는 API 요청 없이 건너뜁니다.
+API 키를 교체해도 완료된 배치는 재수집하지 않습니다.
+
+배치 ID = video_id를 알파벳순 정렬 후 50개씩 묶은 배치 번호
+
+═══════════════════════════════════════════════════════════════
+API 키 설정
+═══════════════════════════════════════════════════════════════
+코드 상단 API_KEY 변수에 입력하거나
+--api-key 인자로 전달하세요.
+
+쿼터 비용: videos.list 1회 = 1 unit
+           배치당(50개) 1 unit → 매우 저렴
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set, Tuple
+
+import pandas as pd
+import requests
+
+
+# ═══════════════════════════════════════════════════════════════
+# 설정값
+# ═══════════════════════════════════════════════════════════════
+
+API_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+# ✅ 여기에 YouTube Data API 키를 입력하세요
+API_KEY = "KEY"
+
+# 정책 기준일 (weeks_from_policy 계산용)
+POLICY1_DATE = datetime(2024, 3, 18, tzinfo=timezone.utc)
+POLICY2_DATE = datetime(2025, 7, 15, tzinfo=timezone.utc)
+
+# 입출력 파일
+DEFAULT_INPUT             = "01_seed_videos.csv"
+DEFAULT_OUTPUT            = "02_videos_meta.csv"
+DEFAULT_COMPLETED_BATCHES = "02_completed_batches.txt"
+
+BATCH_SIZE = 50  # videos.list 한 번에 최대 50개
+
+# CSV 출력 컬럼
+OUTPUT_COLUMNS = [
+    "video_id",
+    "channel_id",
+    "published_at",
+    "video_title",
+    "video_description",
+    "video_tags",
+    "duration_sec",
+    "view_count",
+    "like_count",
+    "is_ai_cover",
+    "week_start_date",
+    "weeks_from_policy1",
+    "weeks_from_policy2",
+    "search_window_start",
+    "collected_at_utc",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# AI Cover 분류 사전
+# ═══════════════════════════════════════════════════════════════
+
+# 포함 신호: 이 단어가 title/description/tags에 있으면 AI Cover 후보
+INCLUDE_SIGNALS = [
+    "cover ai",
+    "ai cover",
+    "aicover",
+    "coverai",
+    "kpop cover",
+    "ai커버",
+    "ai 커버",
+    "generated using ai",
+    "ai ver",
+    "ai version",
+    "ai generated",
+    "ai vocal",
+    "ai singing",
+    "ai vocals",
+    "ai remix",
+    "using ai",
+    "synthetically generated",
+]
+
+# 제외 신호: 이 단어가 있으면 AI Cover 콘텐츠가 아닐 가능성이 높음
+# (튜토리얼, 리뷰, 뉴스, 반응 영상 등)
+EXCLUDE_SIGNALS = [
+    "tutorial",
+    "how to",
+    "how-to",
+    "review",
+    "reaction",
+    "reacting",
+    "news",
+    "guide",
+    "tool review",
+    "how to make",
+    "how to generate",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 커맨드라인 인자
+# ═══════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "01_seed_videos.csv의 video_id로 상세 메타데이터를 수집하고\n"
+            "AI Cover 여부를 분류합니다.\n"
+            "\n"
+            "Resume 방식: 완료된 배치는 API 요청 없이 건너뜁니다."
+        )
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=API_KEY,
+        help="YouTube Data API 키",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=DEFAULT_INPUT,
+        help=f"입력 CSV 파일 (기본값: {DEFAULT_INPUT})",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=DEFAULT_OUTPUT,
+        help=f"출력 CSV 파일 (기본값: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--completed-batches",
+        type=str,
+        default=DEFAULT_COMPLETED_BATCHES,
+        help=f"완료된 배치 기록 파일 (기본값: {DEFAULT_COMPLETED_BATCHES})",
+    )
+    parser.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=0.05,
+        help="API 요청 간 대기 시간(초) (기본값: 0.05, videos.list는 쿼터가 저렴함)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        default=False,
+        help="처음부터 다시 수집 (기존 출력 파일 삭제)",
+    )
+    return parser.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 입력값 검증
+# ═══════════════════════════════════════════════════════════════
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.api_key or args.api_key == "여기에_API_키_입력":
+        raise ValueError(
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌ API 키가 설정되지 않았습니다.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "방법 1. 코드 상단 API_KEY 변수에 직접 입력:\n"
+            '  API_KEY = "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"\n'
+            "\n"
+            "방법 2. 커맨드라인 인자로 전달:\n"
+            '  python 02_fetch_videos_meta.py --api-key "AIzaSyXXXX..."\n'
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    if not os.path.exists(args.input):
+        raise FileNotFoundError(
+            f"입력 파일을 찾을 수 없습니다: {args.input}\n"
+            "01_search_ai_cover.py를 먼저 실행하세요."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 입력 데이터 로드
+# ═══════════════════════════════════════════════════════════════
+
+def load_seed_videos(input_path: str) -> pd.DataFrame:
+    """
+    01_seed_videos.csv를 로드합니다.
+
+    동일 video_id가 여러 윈도우에서 중복 수집됐을 수 있으므로
+    video_id 기준으로 중복을 제거합니다.
+    단, search_window_start는 첫 번째 값(가장 이른 윈도우)을 유지합니다.
+    """
+    df = pd.read_csv(input_path)
+
+    print(f"[INFO] 입력 파일 총 행 수: {len(df):,}")
+
+    # video_id 기준 중복 제거 (search_window_start는 첫 번째 값 유지)
+    df = df.sort_values("search_window_start").drop_duplicates(
+        subset=["video_id"], keep="first"
+    ).reset_index(drop=True)
+
+    print(f"[INFO] 중복 제거 후 고유 video_id 수: {len(df):,}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
+# 완료된 배치 관리
+# ═══════════════════════════════════════════════════════════════
+
+def load_completed_batches(filepath: str) -> Set[int]:
+    """
+    02_completed_batches.txt에서 완료된 배치 번호를 로드합니다.
+    배치 번호 = 0부터 시작하는 정수 (배치 인덱스)
+
+    완료된 배치는 API 요청 없이 건너뜁니다.
+    API 키를 교체해도 이 파일은 유지됩니다.
+    """
+    completed: Set[int] = set()
+    if not os.path.exists(filepath):
+        return completed
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            val = line.strip()
+            if val.isdigit():
+                completed.add(int(val))
+
+    return completed
+
+
+def mark_batch_completed(filepath: str, batch_idx: int) -> None:
+    """
+    배치가 정상 완료됐을 때 배치 번호를 기록합니다.
+    에러가 발생한 배치는 기록하지 않아 다음 실행 시 재수집됩니다.
+    """
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(f"{batch_idx}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 파일 초기화
+# ═══════════════════════════════════════════════════════════════
+
+def reset_output_files(output_path: str, completed_path: str) -> None:
+    for path in [output_path, completed_path]:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[RESET] 삭제됨: {path}")
+
+
+def ensure_csv_header(output_path: str) -> None:
+    if os.path.exists(output_path):
+        return
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer.writeheader()
+
+
+# ═══════════════════════════════════════════════════════════════
+# ISO 8601 Duration → 초 변환
+# ═══════════════════════════════════════════════════════════════
+
+def parse_duration_to_seconds(duration: str) -> Optional[int]:
+    """
+    YouTube ISO 8601 duration을 초 단위로 변환합니다.
+
+    예시:
+      PT35S    → 35
+      PT3M26S  → 206
+      PT1H2M5S → 3725
+
+    Shorts 판별에 사용됩니다 (60초 이하 = Shorts proxy)
+    """
+    if not duration:
+        return None
+
+    pattern = re.compile(
+        r"^P"
+        r"(?:(?P<days>\d+)D)?"
+        r"(?:T"
+        r"(?:(?P<hours>\d+)H)?"
+        r"(?:(?P<minutes>\d+)M)?"
+        r"(?:(?P<seconds>\d+)S)?"
+        r")?$"
+    )
+    match = pattern.match(duration)
+    if not match:
+        return None
+
+    parts = match.groupdict(default="0")
+    return (
+        int(parts["days"])    * 86400 +
+        int(parts["hours"])   * 3600  +
+        int(parts["minutes"]) * 60    +
+        int(parts["seconds"])
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 주차 계산
+# ═══════════════════════════════════════════════════════════════
+
+def get_week_start_date(published_at: str) -> str:
+    """
+    게시일 기준 ISO week 시작일(월요일)을 반환합니다.
+    Event Study의 시간 축으로 사용됩니다.
+
+    예시: "2024-03-20T12:00:00Z" → "2024-03-18" (해당 주 월요일)
+    """
+    try:
+        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        # 월요일(weekday=0) 기준 ISO week 시작일
+        week_start = dt - timedelta(days=dt.weekday())
+        return week_start.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def get_weeks_from_policy(published_at: str, policy_date: datetime) -> Optional[float]:
+    """
+    게시일 기준 정책 시점으로부터 몇 주 경과했는지 계산합니다.
+
+    양수: 정책 이후 (post-policy)
+    음수: 정책 이전 (pre-policy)
+    0   : 정책 시행 주
+
+    Event Study의 핵심 변수로 사용됩니다.
+    """
+    try:
+        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        delta_days = (dt - policy_date).days
+        return round(delta_days / 7, 2)
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# AI Cover 분류
+# ═══════════════════════════════════════════════════════════════
+
+def classify_ai_cover(
+    title: str,
+    description: str,
+    tags: str,
+) -> int:
+    """
+    영상이 실제 AI Cover 콘텐츠인지 규칙 기반으로 분류합니다.
+
+    분류 로직:
+      1. title + description + tags를 합쳐서 소문자로 변환
+      2. EXCLUDE_SIGNALS(튜토리얼, 리뷰 등)가 있으면 0 반환
+      3. INCLUDE_SIGNALS(rvc, voice clone 등)가 있으면 1 반환
+      4. 둘 다 없으면 0 반환
+
+    Returns:
+      1: AI Cover 영상 (분석 표본에 포함)
+      0: AI Cover 아님 (분석 표본에서 제외)
+    """
+    # 텍스트 통합 및 소문자 변환
+    combined = f"{title} {description} {tags}".lower()
+
+    # 제외 신호 먼저 확인 (튜토리얼, 리뷰 등은 AI Cover 콘텐츠가 아님)
+    for signal in EXCLUDE_SIGNALS:
+        if signal in combined:
+            return 0
+
+    # 포함 신호 확인
+    for signal in INCLUDE_SIGNALS:
+        if signal in combined:
+            return 1
+
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# API 요청
+# ═══════════════════════════════════════════════════════════════
+
+def request_videos_batch(
+    api_key: str,
+    video_ids: List[str],
+    session: Optional[requests.Session] = None,
+) -> Dict:
+    """
+    videos.list API를 호출하여 영상 메타데이터를 수집합니다.
+
+    수집 part:
+      - snippet        : title, description, tags, publishedAt, channelId
+      - contentDetails : duration
+      - statistics     : viewCount, likeCount
+    """
+    params = {
+        "key":        api_key,
+        "part":       "snippet,contentDetails,statistics",
+        "id":         ",".join(video_ids),
+        "maxResults": len(video_ids),
+    }
+
+    requester = session or requests
+    response  = requester.get(API_URL, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 응답 파싱
+# ═══════════════════════════════════════════════════════════════
+
+def parse_video_items(
+    items: List[Dict],
+    seed_lookup: Dict[str, str],  # video_id → search_window_start
+) -> List[Dict]:
+    """
+    videos.list 응답을 파싱하여 필요한 컬럼만 추출합니다.
+
+    seed_lookup:
+      01_seed_videos.csv에서 가져온 video_id → search_window_start 매핑
+      provenance 정보로 CSV에 저장됩니다.
+    """
+    collected_at_utc = datetime.now(timezone.utc).isoformat()
+    rows: List[Dict] = []
+
+    for item in items:
+        video_id         = item.get("id", "")
+        snippet          = item.get("snippet", {}) or {}
+        content_details  = item.get("contentDetails", {}) or {}
+        statistics       = item.get("statistics", {}) or {}
+
+        # 기본 메타데이터
+        published_at = snippet.get("publishedAt", "")
+        title        = snippet.get("title", "")
+        description  = snippet.get("description", "")
+
+        # tags는 리스트 → " | "로 join
+        tags_list = snippet.get("tags", []) or []
+        tags      = " | ".join(str(t) for t in tags_list)
+
+        # duration → 초 변환
+        duration_raw = content_details.get("duration", "")
+        duration_sec = parse_duration_to_seconds(duration_raw)
+
+        # 통계
+        view_count = int(statistics.get("viewCount", 0) or 0)
+        like_count = int(statistics.get("likeCount", 0) or 0)
+
+        # AI Cover 분류
+        is_ai_cover = classify_ai_cover(title, description, tags)
+
+        # 주차 계산
+        week_start_date    = get_week_start_date(published_at)
+        weeks_from_policy1 = get_weeks_from_policy(published_at, POLICY1_DATE)
+        weeks_from_policy2 = get_weeks_from_policy(published_at, POLICY2_DATE)
+
+        rows.append({
+            "video_id":            video_id,
+            "channel_id":          snippet.get("channelId", ""),
+            "published_at":        published_at,
+            "video_title":         title,
+            "video_description":   description,
+            "video_tags":          tags,
+            "duration_sec":        duration_sec,
+            "view_count":          view_count,
+            "like_count":          like_count,
+            "is_ai_cover":         is_ai_cover,
+            "week_start_date":     week_start_date,
+            "weeks_from_policy1":  weeks_from_policy1,
+            "weeks_from_policy2":  weeks_from_policy2,
+            "search_window_start": seed_lookup.get(video_id, ""),
+            "collected_at_utc":    collected_at_utc,
+        })
+
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════
+# CSV 저장
+# ═══════════════════════════════════════════════════════════════
+
+def append_rows(output_path: str, rows: List[Dict]) -> int:
+    if not rows:
+        return 0
+    with open(output_path, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer.writerows(rows)
+    return len(rows)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 쿼터 초과 감지
+# ═══════════════════════════════════════════════════════════════
+
+def is_quota_exceeded(exc: requests.HTTPError) -> bool:
+    try:
+        text = exc.response.text.lower()
+    except Exception:
+        text = str(exc).lower()
+    return "quotaexceeded" in text
+
+
+# ═══════════════════════════════════════════════════════════════
+# 배치 생성
+# ═══════════════════════════════════════════════════════════════
+
+def make_batches(
+    video_ids: List[str],
+    batch_size: int,
+) -> List[List[str]]:
+    """video_id 리스트를 batch_size 단위로 분할합니다."""
+    return [
+        video_ids[i:i + batch_size]
+        for i in range(0, len(video_ids), batch_size)
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 메인 실행
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    # reset 모드
+    if args.reset:
+        print("\n[RESET] 기존 파일을 삭제하고 처음부터 수집합니다.")
+        reset_output_files(args.output, args.completed_batches)
+
+    # ─────────────────────────────────────────────────────────
+    # 입력 데이터 로드
+    # ─────────────────────────────────────────────────────────
+    seed_df = load_seed_videos(args.input)
+
+    # video_id → search_window_start 매핑 (provenance 보존용)
+    seed_lookup: Dict[str, str] = dict(
+        zip(seed_df["video_id"], seed_df["search_window_start"])
+    )
+
+    # 수집할 video_id 목록 (정렬하여 배치 순서를 일정하게 유지)
+    all_video_ids = sorted(seed_df["video_id"].tolist())
+    batches       = make_batches(all_video_ids, BATCH_SIZE)
+    total_batches = len(batches)
+
+    # ─────────────────────────────────────────────────────────
+    # 완료된 배치 로드
+    # 이 집합에 있는 배치 번호는 API 요청 없이 건너뜁니다.
+    # ─────────────────────────────────────────────────────────
+    completed_batches = load_completed_batches(args.completed_batches)
+
+    # CSV 헤더 초기화
+    ensure_csv_header(args.output)
+
+    pending_count = total_batches - len(completed_batches)
+
+    print("\n" + "═" * 65)
+    print("  영상 메타데이터 수집 (videos.list)")
+    print("═" * 65)
+    print(f"  총 고유 video_id     : {len(all_video_ids):,}개")
+    print(f"  총 배치 수           : {total_batches:,}개 (배치당 {BATCH_SIZE}개)")
+    print(f"  이미 완료된 배치     : {len(completed_batches):,}개 → 건너뜀")
+    print(f"  이번에 수집할 배치   : {pending_count:,}개")
+    print(f"  예상 쿼터 소모       : {pending_count:,} units (매우 저렴)")
+    print(f"  입력 파일            : {args.input}")
+    print(f"  출력 파일            : {args.output}")
+    print(f"  완료 기록 파일       : {args.completed_batches}")
+    print("═" * 65 + "\n")
+
+    # 수집 통계
+    total_requests   = 0
+    total_saved      = 0
+    total_missing    = 0  # API가 반환하지 않은 영상 (삭제/비공개 등)
+    batches_skipped  = 0
+    batches_done     = 0
+    batches_error    = 0
+
+    # AI Cover 분류 통계
+    ai_cover_count   = 0
+    non_cover_count  = 0
+
+    session = requests.Session()
+
+    try:
+        for batch_idx, batch_ids in enumerate(batches):
+
+            # ─────────────────────────────────────────────────
+            # 완료된 배치 건너뛰기
+            # API 요청 자체를 보내지 않습니다.
+            # ─────────────────────────────────────────────────
+            if batch_idx in completed_batches:
+                batches_skipped += 1
+                print(
+                    f"[BATCH {batch_idx+1:4d}/{total_batches}] "
+                    f"ids={len(batch_ids)} | ✅ SKIP"
+                )
+                continue
+
+            print(
+                f"[BATCH {batch_idx+1:4d}/{total_batches}] "
+                f"ids={len(batch_ids)}"
+            )
+
+            batch_error = False
+
+            try:
+                data = request_videos_batch(
+                    api_key    = args.api_key,
+                    video_ids  = batch_ids,
+                    session    = session,
+                )
+                total_requests += 1
+
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", "unknown")
+                print(f"  [ERROR] HTTP {status}: {exc}")
+
+                if is_quota_exceeded(exc):
+                    print(
+                        "\n  [STOP] ❌ 쿼터 초과 감지. 즉시 중단합니다.\n"
+                        f"  현재 배치({batch_idx})는 완료 기록되지 않았으므로\n"
+                        "  내일 다시 실행하면 이 배치부터 이어서 수집됩니다."
+                    )
+                    raise
+
+                batch_error = True
+
+            except requests.RequestException as exc:
+                print(f"  [ERROR] 요청 실패: {exc}")
+                batch_error = True
+
+            if batch_error:
+                batches_error += 1
+                print(f"  → ⚠️  에러 발생 → 다음 실행 시 재수집")
+                time.sleep(args.sleep_seconds)
+                continue
+
+            # ─────────────────────────────────────────────────
+            # 응답 파싱 및 저장
+            # ─────────────────────────────────────────────────
+            items = data.get("items", [])
+
+            # API가 반환하지 않은 영상 (삭제/비공개/지역 제한 등)
+            returned_ids = {item.get("id", "") for item in items}
+            missing_ids  = [vid for vid in batch_ids if vid not in returned_ids]
+            total_missing += len(missing_ids)
+
+            rows     = parse_video_items(items, seed_lookup)
+            saved    = append_rows(args.output, rows)
+            total_saved += saved
+
+            # 분류 통계 업데이트
+            for row in rows:
+                if row["is_ai_cover"] == 1:
+                    ai_cover_count += 1
+                else:
+                    non_cover_count += 1
+
+            print(
+                f"  returned={len(items):3d}  "
+                f"saved={saved:3d}  "
+                f"missing={len(missing_ids):2d}  "
+                f"ai_cover={sum(1 for r in rows if r['is_ai_cover']==1):3d}"
+            )
+
+            if missing_ids:
+                print(
+                    f"  [참고] API 미반환 video_id "
+                    f"(삭제/비공개/지역제한 등): {missing_ids[:5]}"
+                    f"{'...' if len(missing_ids) > 5 else ''}"
+                )
+
+            # ─────────────────────────────────────────────────
+            # 배치 완료 기록
+            # 정상 완료된 배치만 기록합니다.
+            # ─────────────────────────────────────────────────
+            mark_batch_completed(args.completed_batches, batch_idx)
+            completed_batches.add(batch_idx)
+            batches_done += 1
+
+            time.sleep(args.sleep_seconds)
+
+    except requests.HTTPError:
+        pass
+
+    finally:
+        session.close()
+
+    # ─────────────────────────────────────────────────────────
+    # 최종 결과 출력
+    # ─────────────────────────────────────────────────────────
+    total_classified = ai_cover_count + non_cover_count
+    ai_cover_rate = (
+        ai_cover_count / total_classified * 100
+        if total_classified > 0 else 0
+    )
+
+    print("\n" + "═" * 65)
+    print("  수집 결과")
+    print("═" * 65)
+    print(f"  총 API 요청 수         : {total_requests:,}회")
+    print(f"  총 저장 행 수          : {total_saved:,}개")
+    print(f"  API 미반환 영상        : {total_missing:,}개 (삭제/비공개 등)")
+    print(f"  건너뛴 배치            : {batches_skipped:,}개 (이미 완료)")
+    print(f"  이번에 완료된 배치     : {batches_done:,}개")
+    print(f"  에러 배치              : {batches_error:,}개")
+    print("─" * 65)
+    print(f"  is_ai_cover=1 (분석 표본) : {ai_cover_count:,}개 ({ai_cover_rate:.1f}%)")
+    print(f"  is_ai_cover=0 (제외)      : {non_cover_count:,}개")
+    print(f"  출력 파일              : {args.output}")
+    print(f"  완료 기록 파일         : {args.completed_batches}")
+    print("═" * 65)
+
+    remaining = total_batches - batches_skipped - batches_done
+    if remaining > 0:
+        print(
+            f"\n  ⚠️  아직 {remaining}개 배치가 남아있습니다.\n"
+            "  다시 실행하면 이어서 수집됩니다."
+        )
+    else:
+        print(
+            "\n  🎉 모든 배치 수집 완료!\n"
+            "  다음 단계: python 03_fetch_channels_meta.py\n"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\n[STOPPED] 사용자에 의해 중단되었습니다.\n"
+            "현재 배치는 완료 기록되지 않았으므로\n"
+            "다시 실행하면 해당 배치부터 이어서 수집됩니다."
+        )
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[FATAL] 예상치 못한 오류: {exc}")
+        sys.exit(1)
